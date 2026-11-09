@@ -1,18 +1,23 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading.Channels;
 using ClickHouse.Client.Copy;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using ClickHouse.Client.ADO;
 
+namespace Telemetry_AnalyticsService;
+
 public record MetricPayload(
-    Guid AgentId, 
-    DateTime Timestamp, 
-    double CpuUsage, 
-    double MemoryUsage, 
-    double DiskSpace,
-    long NetworkRxBytes,
-    long NetworkTxBytes);
+    [property: JsonPropertyName("instanceId")] Guid AgentId, 
+    [property: JsonPropertyName("Timestamp")] DateTime Timestamp, 
+    [property: JsonPropertyName("CpuLoad")] double CpuUsage, 
+    [property: JsonPropertyName("RamLoad")] double MemoryUsage, 
+    [property: JsonPropertyName("FreeDiskSpace")] double DiskSpace,
+    [property: JsonPropertyName("WiFiRx")] double NetworkRxBytes,
+    [property: JsonPropertyName("WiFiTx")] double NetworkTxBytes 
+);
+
 public class MetricsIngestionWorker : BackgroundService
 {
     private readonly IConfiguration _config;
@@ -32,51 +37,81 @@ public class MetricsIngestionWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var clickHouseTask = ProcessBatchesAsync(stoppingToken);
-
-        var factory = new ConnectionFactory { HostName = _config["RabbitMQ:Host"] ?? throw new Exception("No rabbitmq host") };
+        var factory = new ConnectionFactory { 
+            HostName = _config["RabbitMQ:Host"] ?? throw new Exception("No rabbitmq host"),
+            UserName = _config["RabbitMQ:username"] ?? throw new Exception("No rabbitmq username"),
+            Password = _config["RabbitMQ:password"] ?? throw new Exception("No rabbitmq password")
+        };
         using var connection = await factory.CreateConnectionAsync();
         using var rmqChannel = await connection.CreateChannelAsync();
+
+        await rmqChannel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1000, global: false);
 
         var consumer = new AsyncEventingBasicConsumer(rmqChannel);
 
         consumer.ReceivedAsync += async (model, ea) =>
         {
-            var body = ea.Body.ToArray();
-            var payload = JsonSerializer.Deserialize<MetricPayload>(body);
-
-            if (payload != null)
+            try
             {
-                await _channel.Writer.WriteAsync(payload, stoppingToken);
-            }
+                var body = ea.Body.ToArray();
+                var payload = JsonSerializer.Deserialize<MetricPayload>(body);
 
-            await rmqChannel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false); 
+                if (payload != null)
+                {
+                    await _channel.Writer.WriteAsync(payload, stoppingToken);
+                }
+                await rmqChannel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false); 
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Помилка парсингу повідомлення. Дані: {Json}", System.Text.Encoding.UTF8.GetString(ea.Body.ToArray()));
+                
+
+                await rmqChannel.BasicNackAsync(deliveryTag: ea.DeliveryTag, multiple: false, requeue: false);
+            }
         };
 
-        await rmqChannel.BasicConsumeAsync(queue: "metrics_queue", autoAck: false, consumer: consumer);
+        await rmqChannel.BasicConsumeAsync(queue: "analytics-metrics_queue", autoAck: false, consumer: consumer);
 
-        await clickHouseTask;
+        await ProcessBatchesAsync(stoppingToken);
     }
 
     private async Task ProcessBatchesAsync(CancellationToken stoppingToken)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
         var buffer = new List<MetricPayload>(BatchSize);
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            await timer.WaitForNextTickAsync(stoppingToken);
-            
-            while (_channel.Reader.TryRead(out var metric))
+            try
             {
-                buffer.Add(metric);
-                if (buffer.Count >= BatchSize) break;
-            }
+                var firstMetric = await _channel.Reader.ReadAsync(stoppingToken);
+                buffer.Add(firstMetric);
 
-            if (buffer.Count > 0)
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                cts.CancelAfter(TimeSpan.FromSeconds(2));
+
+                try
+                {
+                    while (buffer.Count < BatchSize)
+                    {
+                        var metric = await _channel.Reader.ReadAsync(cts.Token);
+                        buffer.Add(metric);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    
+                }
+
+                if (buffer.Count > 0)
+                {
+                    await BulkInsertToClickHouseAsync(buffer, stoppingToken);
+                    buffer.Clear();
+                }
+            }
+            catch (OperationCanceledException)
             {
-                await BulkInsertToClickHouseAsync(buffer, stoppingToken);
-                buffer.Clear();
+                break;
             }
         }
     }
@@ -91,6 +126,8 @@ public class MetricsIngestionWorker : BackgroundService
                 DestinationTableName = "SystemMetrics",
                 BatchSize = metrics.Count
             };
+
+            await bulkCopy.InitAsync();
 
             var rows = metrics.Select(m => new object[] 
             { 
