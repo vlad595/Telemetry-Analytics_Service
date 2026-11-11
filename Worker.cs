@@ -5,6 +5,7 @@ using ClickHouse.Client.Copy;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using ClickHouse.Client.ADO;
+using Services;
 
 namespace Telemetry_AnalyticsService;
 
@@ -18,18 +19,25 @@ public record MetricPayload(
     [property: JsonPropertyName("WiFiTx")] double NetworkTxBytes 
 );
 
+public record StoredMetric(MetricPayload Metric, DateTime ExpiresAt);
+
 public class MetricsIngestionWorker : BackgroundService
 {
     private readonly IConfiguration _config;
     private readonly ILogger<MetricsIngestionWorker> _logger;
-    private readonly Channel<MetricPayload> _channel;
+    private readonly IUserSubscriptionHandler _subscriptionHandler;
+    private readonly Channel<StoredMetric> _channel;
     private const int BatchSize = 1000;
 
-    public MetricsIngestionWorker(IConfiguration config, ILogger<MetricsIngestionWorker> logger)
+    public MetricsIngestionWorker(
+        IConfiguration config,
+        ILogger<MetricsIngestionWorker> logger,
+        IUserSubscriptionHandler subscriptionHandler)
     {
         _config = config;
         _logger = logger;
-        _channel = Channel.CreateBounded<MetricPayload>(new BoundedChannelOptions(50000)
+        _subscriptionHandler = subscriptionHandler;
+        _channel = Channel.CreateBounded<StoredMetric>(new BoundedChannelOptions(50000)
         {
             FullMode = BoundedChannelFullMode.Wait
         });
@@ -37,6 +45,8 @@ public class MetricsIngestionWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await EnsureClickHouseTtlAsync(stoppingToken);
+
         var factory = new ConnectionFactory { 
             HostName = _config["RabbitMQ:Host"] ?? throw new Exception("No rabbitmq host"),
             UserName = _config["RabbitMQ:username"] ?? throw new Exception("No rabbitmq username"),
@@ -58,7 +68,10 @@ public class MetricsIngestionWorker : BackgroundService
 
                 if (payload != null)
                 {
-                    await _channel.Writer.WriteAsync(payload, stoppingToken);
+                    int subscriptionTier = await _subscriptionHandler.GetSubscriptionTier(payload.AgentId.ToString());
+                    int retentionDays = subscriptionTier == 2 ? 1 : 7;
+                    var storedMetric = new StoredMetric(payload, payload.Timestamp.AddDays(retentionDays));
+                    await _channel.Writer.WriteAsync(storedMetric, stoppingToken);
                 }
                 await rmqChannel.BasicAckAsync(deliveryTag: ea.DeliveryTag, multiple: false); 
             }
@@ -78,7 +91,7 @@ public class MetricsIngestionWorker : BackgroundService
 
     private async Task ProcessBatchesAsync(CancellationToken stoppingToken)
     {
-        var buffer = new List<MetricPayload>(BatchSize);
+        var buffer = new List<StoredMetric>(BatchSize);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -116,7 +129,25 @@ public class MetricsIngestionWorker : BackgroundService
         }
     }
 
-    private async Task BulkInsertToClickHouseAsync(List<MetricPayload> metrics, CancellationToken token)
+    private async Task EnsureClickHouseTtlAsync(CancellationToken token)
+    {
+        using var connection = new ClickHouseConnection(_config.GetConnectionString("ClickHouse"));
+        await connection.OpenAsync(token);
+
+        using (var addExpiryColumn = connection.CreateCommand())
+        {
+            addExpiryColumn.CommandText = "ALTER TABLE SystemMetrics ADD COLUMN IF NOT EXISTS ExpiresAt DateTime DEFAULT Timestamp + INTERVAL 7 DAY";
+            await addExpiryColumn.ExecuteNonQueryAsync(token);
+        }
+
+        using (var configureTtl = connection.CreateCommand())
+        {
+            configureTtl.CommandText = "ALTER TABLE SystemMetrics MODIFY TTL ExpiresAt";
+            await configureTtl.ExecuteNonQueryAsync(token);
+        }
+    }
+
+    private async Task BulkInsertToClickHouseAsync(List<StoredMetric> metrics, CancellationToken token)
     {
         try
         {
@@ -124,6 +155,7 @@ public class MetricsIngestionWorker : BackgroundService
             using var bulkCopy = new ClickHouseBulkCopy(connection)
             {
                 DestinationTableName = "SystemMetrics",
+                ColumnNames = new[] { "AgentId", "Timestamp", "CpuUsage", "MemoryUsage", "DiskSpace", "NetworkRxBytes", "NetworkTxBytes", "ExpiresAt" },
                 BatchSize = metrics.Count
             };
 
@@ -131,7 +163,7 @@ public class MetricsIngestionWorker : BackgroundService
 
             var rows = metrics.Select(m => new object[] 
             { 
-                m.AgentId, m.Timestamp, m.CpuUsage, m.MemoryUsage, m.DiskSpace, m.NetworkRxBytes, m.NetworkTxBytes 
+                m.Metric.AgentId, m.Metric.Timestamp, m.Metric.CpuUsage, m.Metric.MemoryUsage, m.Metric.DiskSpace, m.Metric.NetworkRxBytes, m.Metric.NetworkTxBytes, m.ExpiresAt
             }).ToArray();
 
             await bulkCopy.WriteToServerAsync(rows, token);
