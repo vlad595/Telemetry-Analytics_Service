@@ -45,6 +45,8 @@ public class MetricsIngestionWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await EnsureClickHouseTableAsync(stoppingToken);
+
         await EnsureClickHouseTtlAsync(stoppingToken);
 
         var factory = new ConnectionFactory { 
@@ -173,5 +175,34 @@ public class MetricsIngestionWorker : BackgroundService
         {
             _logger.LogError(ex, "Помилка запису в ClickHouse");
         }
+    }
+    private async Task EnsureClickHouseTableAsync(CancellationToken token)
+    {
+        using var connection = new ClickHouseConnection(
+            _config.GetConnectionString("ClickHouse"));
+
+        await connection.OpenAsync(token);
+
+        using var command = connection.CreateCommand();
+
+        command.CommandText = """
+            CREATE TABLE IF NOT EXISTS SystemMetrics
+            (
+                AgentId UUID,
+                Timestamp DateTime64(3, 'UTC'),
+                CpuUsage Float64,
+                MemoryUsage Float64,
+                DiskSpace Float64,
+                NetworkRxBytes Float64,
+                NetworkTxBytes Float64,
+                ExpiresAt DateTime DEFAULT toDateTime(Timestamp) + INTERVAL 7 DAY
+            )
+            ENGINE = MergeTree()
+            PARTITION BY toYYYYMM(Timestamp)
+            ORDER BY (AgentId, Timestamp)
+            TTL ExpiresAt
+            """;
+
+        await command.ExecuteNonQueryAsync(token);
     }
 }
